@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"crypto/tls"
-	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -13,79 +12,99 @@ import (
 	"path/filepath"
 )
 
-func main() {
-	name := flag.String("name", "", "The name for the certificate that will be displayed in the Sophos Webinterface")
-	username := flag.String("username", "", "Username for authentication")
-	password := flag.String("password", "", "Password for authentication")
-	certFilePath := flag.String("cert", "", "Path to certificate file")
-	keyFilePath := flag.String("key", "", "Path to key file")
-	ip := flag.String("ip", "", "Ipv4 address from the sophos firewall")
-	port := flag.Uint("port", 4444, "The port for the sophos firewall")
-	flag.Parse()
+const xmlRequestFormat string = `<Request><Login><Username>%s</Username><Password>%s</Password></Login><Set><Certificate transactionid="10"><Name>%s</Name><Action>UploadCertificate</Action><CertificateFormat>pem</CertificateFormat><CertificateFile>%s</CertificateFile><PrivateKeyFile>%s</PrivateKeyFile></Certificate></Set></Request>`
 
-	certFile, err := os.Open(*certFilePath)
-	defer certFile.Close()
+func PrintUsage() {
+	fmt.Printf("%s <ip:port> <username> <password> <name> <cert path> <key path>\n", os.Args[0])
+}
+
+func writeMultipartFormFile(multipartWriter *multipart.Writer, fieldName, filePath string) error {
+	file, err := os.Open(filePath)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
-	certFileName := filepath.Base(*certFilePath)
+	defer file.Close()
 
-	keyFile, err := os.Open(*keyFilePath)
-	defer keyFile.Close()
+	fileName := filepath.Base(filePath)
+	fileWriter, err := multipartWriter.CreateFormFile(fieldName, fileName)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
-	keyFileName := filepath.Base(*keyFilePath)
+	_, err = io.Copy(fileWriter, file)
+	if err != nil {
+		return err
+	}
+	return nil
+}
 
+func buildPayload(username, password, name, certFilePath, keyFilePath string) (*bytes.Buffer, string, error) {
 	payload := &bytes.Buffer{}
 	multipartWriter := multipart.NewWriter(payload)
 
-	certWriter, err := multipartWriter.CreateFormFile("Certificate", certFileName)
+	err := writeMultipartFormFile(multipartWriter, "Certificate", certFilePath)
 	if err != nil {
-		log.Fatal(err)
-	}
-	_, err = io.Copy(certWriter, certFile)
-	if err != nil {
-		log.Fatal(err)
+		return nil, "", err
 	}
 
-	keyWriter, err := multipartWriter.CreateFormFile("Private Key", keyFileName)
+	err = writeMultipartFormFile(multipartWriter, "Private Key", keyFilePath)
 	if err != nil {
-		log.Fatal(err)
-	}
-	_, err = io.Copy(keyWriter, keyFile)
-	if err != nil {
-		log.Fatal(err)
+		return nil, "", err
 	}
 
-	reqStr := fmt.Sprintf(`<Request><Login><Username>%s</Username><Password>%s</Password></Login><Set><Certificate transactionid="10"><Name>%s</Name><Action>UploadCertificate</Action><CertificateFormat>pem</CertificateFormat><CertificateFile>%s</CertificateFile><PrivateKeyFile>%s</PrivateKeyFile></Certificate></Set></Request>`, *username, *password, *name, certFileName, keyFileName)
-	err = multipartWriter.WriteField("reqxml", reqStr)
+	reqXml := fmt.Sprintf(xmlRequestFormat, username, password, name, filepath.Base(certFilePath), filepath.Base(keyFilePath))
+	err = multipartWriter.WriteField("reqxml", reqXml)
 	if err != nil {
-		log.Fatal(err)
+		return nil, "", err
 	}
 	err = multipartWriter.Close()
 	if err != nil {
-		log.Fatal(err)
+		return nil, "", err
 	}
 
-	url := fmt.Sprintf("https://%s:%d/webconsole/APIController", *ip, *port)
+	return payload, multipartWriter.FormDataContentType(), nil
+}
+
+func sendAPIRequest(url, contentType string, payload io.Reader) (*http.Response, error) {
 	client := &http.Client{
 		Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}},
 	}
+
 	req, err := http.NewRequest("GET", url, payload)
 	if err != nil {
-		log.Fatal(err)
+		return nil, err
 	}
-	req.Header.Set("Content-Type", multipartWriter.FormDataContentType())
-	res, err := client.Do(req)
+	req.Header.Set("Content-Type", contentType)
+
+	return client.Do(req)
+}
+
+func main() {
+	if len(os.Args) != 7 {
+		PrintUsage()
+		os.Exit(1)
+	}
+	args := os.Args[1:]
+	address := args[0]
+	username := args[1]
+	password := args[2]
+	name := args[3]
+	certFilePath := args[4]
+	keyFilePath := args[5]
+
+	payload, contentType, err := buildPayload(username, password, name, certFilePath, keyFilePath)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatal("Error while building payload: " + err.Error())
+	}
+
+	url := fmt.Sprintf("https://%s/webconsole/APIController", address)
+	res, err := sendAPIRequest(url, contentType, payload)
+	if err != nil {
+		log.Fatal("Error while sending api request: " + err.Error())
 	}
 	defer res.Body.Close()
-
 	body, err := io.ReadAll(res.Body)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatal("Error while parsing response Body: " + err.Error())
 	}
-	fmt.Println(string(body))
+	fmt.Printf("Response:\n%s", body)
 }
